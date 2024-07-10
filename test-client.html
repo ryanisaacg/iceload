@@ -10,8 +10,13 @@
   <script src="client.js"> </script>
   <script type="module">
     async function main() {
-      const client = new IceloadClient('ws://localhost:9002')
-      console.log(await client.get("hello"));
+      const client = await IceloadClient.connect('ws://localhost:9002');
+      client.subscribe("hello", (val) => {
+        console.log(val);
+      });
+      client.set("hello", "1");
+      client.set("hello", "2");
+      client.set("hello", "3");
     }
     main();
   </script>

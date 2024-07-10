@@ -26,6 +26,8 @@ async fn main() {
     let (request_send, request_recv) = tokio::sync::mpsc::channel(1024);
     let clients = Arc::new(RwLock::new(ClientManager::new()));
 
+    // TOOD: DB is clone. does that mean I can actually give out a handle of it
+    // for every single client task?
     let server = Server::open("data").unwrap();
     tokio::spawn(server_task(request_recv, clients.clone(), server));
 
@@ -72,8 +74,35 @@ async fn server_task(
                     .await
                     .unwrap();
             }
-            ClientMessageParams::Subscribe(_) => todo!(),
+            ClientMessageParams::Subscribe(key) => {
+                let mut subscriber = server.subscribe(key.as_str());
+                let sender = clients.read().await.sender(id).clone();
+                let key = key.clone();
+                tokio::spawn(async move {
+                    while let Some(event) = (&mut subscriber).await {
+                        match event {
+                            sled::Event::Insert { key: _, value } => {
+                                let value = String::from_utf8(value.to_vec()).unwrap();
+                                sender
+                                    .send(ServerMessage::ValueChanged(key.clone(), Some(value)))
+                                    .await
+                                    .unwrap();
+                            }
+                            sled::Event::Remove { key: _ } => {
+                                sender
+                                    .send(ServerMessage::ValueChanged(key.clone(), None))
+                                    .await
+                                    .unwrap();
+                            }
+                        }
+                    }
+                });
+            }
+            ClientMessageParams::Unsubscribe(_key) => {
+                // TODO
+            }
             ClientMessageParams::Disconnect => {
+                // TODO: unsubscribe from all
                 clients.write().await.remove(id);
             }
         }

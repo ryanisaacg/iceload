@@ -95,6 +95,7 @@ pub enum ClientMessageParams {
     Get(String),
     Set(String, Option<String>),
     Subscribe(String),
+    Unsubscribe(String),
     Disconnect,
 }
 
