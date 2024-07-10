@@ -2,7 +2,7 @@ use sled::{Db, Subscriber};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-pub enum Error {
+pub enum ServerError {
     #[error("{}", .0)]
     SledError(#[from] sled::Error),
 }
@@ -13,12 +13,12 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn open(path: &str) -> Result<Server, Error> {
+    pub fn open(path: &str) -> Result<Server, ServerError> {
         let store = sled::open(path)?;
         Ok(Server { store })
     }
 
-    pub fn get(&self, key: &str) -> Result<Option<String>, Error> {
+    pub fn get(&self, key: &str) -> Result<Option<String>, ServerError> {
         Ok(match self.store.get(key.as_bytes())? {
             Some(val) => {
                 let val = val.to_vec();
@@ -29,7 +29,7 @@ impl Server {
         })
     }
 
-    pub fn set(&self, key: &str, val: Option<&str>) -> Result<Option<String>, Error> {
+    pub fn set(&self, key: &str, val: Option<&str>) -> Result<Option<String>, ServerError> {
         let val = match val {
             Some(val) => self.store.insert(key.as_bytes(), val.as_bytes())?,
             None => self.store.remove(key.as_bytes())?,
@@ -39,5 +39,29 @@ impl Server {
 
     pub fn subscribe(&self, key: &str) -> Subscriber {
         self.store.watch_prefix(key.as_bytes())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sled::Config;
+
+    use super::Server;
+
+    fn test_server() -> Server {
+        let db = Config::new()
+            .temporary(true)
+            .flush_every_ms(None)
+            .open()
+            .unwrap();
+
+        Server { store: db }
+    }
+
+    #[test]
+    fn values() {
+        let server = test_server();
+        server.set("hello", Some("world")).unwrap();
+        assert_eq!(server.get("hello").unwrap(), Some("world".to_string()));
     }
 }
