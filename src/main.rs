@@ -1,12 +1,16 @@
 use std::collections::HashMap;
 
 use futures_util::{SinkExt, StreamExt};
-use iceload::{ClientMessageParams, Server, ServerMessage};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{
     accept_async,
     tungstenite::{self, Error},
 };
+
+mod message;
+use message::{ClientMessage, ServerMessage};
+mod server;
+use server::Server;
 
 #[tokio::main]
 async fn main() {
@@ -46,21 +50,21 @@ async fn client_task(server: Server, stream: TcpStream) -> anyhow::Result<()> {
             Err(err) => return Err(err.into()),
         };
         let msg = msg.to_text()?;
-        let msg: ClientMessageParams = serde_json::from_str(msg)?;
+        let msg: ClientMessage = serde_json::from_str(msg)?;
         match msg {
-            ClientMessageParams::Get(key) => {
+            ClientMessage::Get(key) => {
                 let value = server.get(key.as_str()).unwrap();
                 println!("Get result {value:?}");
                 send_resp.send(ServerMessage::Value(value)).unwrap();
             }
-            ClientMessageParams::Set(key, value) => {
+            ClientMessage::Set(key, value) => {
                 let value = server
                     .set(key.as_str(), value.as_ref().map(|s| s.as_str()))
                     .unwrap();
                 println!("Set result {value:?}");
                 send_resp.send(ServerMessage::Value(value)).unwrap();
             }
-            ClientMessageParams::Subscribe(key) => {
+            ClientMessage::Subscribe(key) => {
                 let mut subscriber = server.subscribe(key.as_str());
                 let sender = send_resp.clone();
                 let key_ = key.clone();
@@ -83,12 +87,12 @@ async fn client_task(server: Server, stream: TcpStream) -> anyhow::Result<()> {
                 });
                 subscriptions.insert(key, handle);
             }
-            ClientMessageParams::Unsubscribe(key) => {
+            ClientMessage::Unsubscribe(key) => {
                 if let Some(handle) = subscriptions.get(&key) {
                     handle.abort();
                 }
             }
-            ClientMessageParams::Disconnect => {
+            ClientMessage::Disconnect => {
                 // TODO: unsubscribe from all
                 todo!()
             }
