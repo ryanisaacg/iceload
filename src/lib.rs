@@ -1,12 +1,9 @@
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use sled::{Db, IVec, Subscriber};
+use sled::{Db, Subscriber};
 use thiserror::Error;
-use tokio::sync::{
-    mpsc::{Receiver, Sender},
-    RwLock,
-};
+use tokio::sync::mpsc::{Receiver, Sender};
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -15,21 +12,42 @@ pub enum Error {
 }
 
 pub struct Server {
-    db: Database,
-    subscribers: HashMap<String, Vec<ClientId>>,
-
-    clients: Arc<RwLock<ClientManager>>,
+    store: Db,
+    _subscribers: HashMap<String, Vec<ClientId>>,
 }
 
 impl Server {
-    pub fn open(clients: Arc<RwLock<ClientManager>>, path: &str) -> Result<Server, Error> {
-        todo!()
+    pub fn open(path: &str) -> Result<Server, Error> {
+        let store = sled::open(path)?;
+        Ok(Server {
+            store,
+            _subscribers: HashMap::new(),
+        })
     }
 
-    fn write(&mut self) {}
-}
+    pub fn get(&self, key: &str) -> Result<Option<String>, Error> {
+        Ok(match self.store.get(key.as_bytes())? {
+            Some(val) => {
+                let val = val.to_vec();
+                let string = String::from_utf8(val).expect("string value");
+                Some(string)
+            }
+            None => None,
+        })
+    }
 
-struct Client {}
+    pub fn set(&self, key: &str, val: Option<&str>) -> Result<Option<String>, Error> {
+        let val = match val {
+            Some(val) => self.store.insert(key.as_bytes(), val.as_bytes())?,
+            None => self.store.remove(key.as_bytes())?,
+        };
+        Ok(val.map(|val| String::from_utf8(val.to_vec()).expect("string value")))
+    }
+
+    pub fn subscribe(&self, key: &str) -> Subscriber {
+        self.store.watch_prefix(key.as_bytes())
+    }
+}
 
 pub struct ClientManager {
     next: u64,
@@ -52,6 +70,14 @@ impl ClientManager {
 
         (id, recv)
     }
+
+    pub fn sender(&self, client_id: ClientId) -> &Sender<ServerMessage> {
+        &self.resp_senders[&client_id]
+    }
+
+    pub fn remove(&mut self, client_id: ClientId) {
+        self.resp_senders.remove(&client_id);
+    }
 }
 
 #[derive(Copy, Clone, Debug, Hash, Eq, PartialEq)]
@@ -67,39 +93,15 @@ pub struct ClientMessage {
 #[derive(Debug, Deserialize, Serialize)]
 pub enum ClientMessageParams {
     Get(String),
-    Set(String, String),
+    Set(String, Option<String>),
     Subscribe(String),
     Disconnect,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 pub enum ServerMessage {
-    Value(String),
-    ValueChanged(String, String),
-}
-
-pub struct Database {
-    store: Db,
-}
-
-impl Database {
-    pub fn open(path: &str) -> Result<Database, Error> {
-        let store = sled::open(path)?;
-        Ok(Database { store })
-    }
-
-    pub fn read(&self, key: &str) -> Result<Option<IVec>, Error> {
-        Ok(self.store.get(key.as_bytes())?)
-    }
-
-    pub fn write(&self, key: &str, val: &str) -> Result<(), Error> {
-        self.store.insert(key.as_bytes(), val.as_bytes())?;
-        Ok(())
-    }
-
-    pub fn subscribe(&self, key: &str) -> Subscriber {
-        self.store.watch_prefix(key.as_bytes())
-    }
+    Value(Option<String>),
+    ValueChanged(String, Option<String>),
 }
 
 pub fn add(left: usize, right: usize) -> usize {
