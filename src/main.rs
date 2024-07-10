@@ -13,15 +13,18 @@ mod server;
 use server::Server;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> anyhow::Result<()> {
     let addr = "127.0.0.1:9002";
-    let listener = TcpListener::bind(&addr).await.expect("Can't listen");
+    let listener = TcpListener::bind(&addr).await?;
 
-    let server = Server::open("data").unwrap();
+    let server = Server::open("data")?;
 
     while let Ok((stream, _)) = listener.accept().await {
-        tokio::spawn(client_task(server.clone(), stream));
+        let server = server.clone();
+        tokio::spawn(async move { client_task(server, stream).await.unwrap() });
     }
+
+    Ok(())
 }
 
 async fn client_task(server: Server, stream: TcpStream) -> anyhow::Result<()> {
