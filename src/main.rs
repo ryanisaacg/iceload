@@ -58,9 +58,7 @@ async fn client_task(server: Server, stream: TcpStream) -> anyhow::Result<()> {
                 send_resp.send(ServerMessage::Value(value)).unwrap();
             }
             ClientMessage::Set(key, value) => {
-                let value = server
-                    .set(key.as_str(), value.as_ref().map(|s| s.as_str()))
-                    .unwrap();
+                let value = server.set(key.as_str(), value.as_deref()).unwrap();
                 println!("Set result {value:?}");
                 send_resp.send(ServerMessage::Value(value)).unwrap();
             }
