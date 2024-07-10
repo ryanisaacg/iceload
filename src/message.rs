@@ -8,7 +8,6 @@ pub enum ClientMessage {
     Set(String, Option<String>),
     Subscribe(String),
     Unsubscribe(String),
-    Disconnect,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

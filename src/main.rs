@@ -90,10 +90,6 @@ async fn client_task(server: Server, stream: TcpStream) -> anyhow::Result<()> {
                     handle.abort();
                 }
             }
-            ClientMessage::Disconnect => {
-                // TODO: unsubscribe from all
-                todo!()
-            }
         }
     }
 
