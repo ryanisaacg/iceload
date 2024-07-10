@@ -11,18 +11,15 @@ pub enum Error {
     SledError(#[from] sled::Error),
 }
 
+#[derive(Clone)]
 pub struct Server {
     store: Db,
-    _subscribers: HashMap<String, Vec<ClientId>>,
 }
 
 impl Server {
     pub fn open(path: &str) -> Result<Server, Error> {
         let store = sled::open(path)?;
-        Ok(Server {
-            store,
-            _subscribers: HashMap::new(),
-        })
+        Ok(Server { store })
     }
 
     pub fn get(&self, key: &str) -> Result<Option<String>, Error> {
