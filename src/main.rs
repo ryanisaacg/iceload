@@ -69,7 +69,7 @@ async fn client_task(server: Server, stream: TcpStream) -> anyhow::Result<()> {
                 let sender = send_resp.clone();
                 let key_ = key.clone();
                 let handle = tokio::spawn(async move {
-                    while let Some(event) = (&mut subscriber).await {
+                    while let Some(event) = subscriber.next().await {
                         match event {
                             sled::Event::Insert { key: _, value } => {
                                 let value = String::from_utf8(value.to_vec()).unwrap();
