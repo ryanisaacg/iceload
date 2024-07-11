@@ -22,7 +22,7 @@ async fn main() -> anyhow::Result<()> {
     let addr = "127.0.0.1:9002";
     let listener = TcpListener::bind(&addr).await?;
 
-    let test_schema = Schema::create(SchemaItem::Document(
+    let test_schema = Schema::new(SchemaItem::Document(
         [(
             "hello".to_string(),
             SchemaItem::Document(
@@ -81,7 +81,7 @@ async fn client_task(server: Server, stream: TcpStream) -> anyhow::Result<()> {
                 println!("Get result {value:?}");
                 send_resp.send(ServerMessage::Value(value)).unwrap();
             }
-            ClientMessage::Set(key, value) => match server.set(&key, &value) {
+            ClientMessage::Set(key, value) => match server.set(&key, value) {
                 Ok(_) => send_resp.send(ServerMessage::Value(Value::Null)).unwrap(),
                 Err(e) => send_resp
                     .send(ServerMessage::Error(format!("{e}")))

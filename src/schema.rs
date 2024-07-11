@@ -9,11 +9,7 @@ use crate::message::RefComponent;
 pub struct Schema(SchemaItem);
 
 impl Schema {
-    pub fn empty() -> Schema {
-        Schema(SchemaItem::Document(HashMap::new()))
-    }
-
-    pub fn create(root: SchemaItem) -> Schema {
+    pub fn new(root: SchemaItem) -> Schema {
         Schema(root)
     }
 
@@ -63,6 +59,7 @@ pub enum SchemaResolutionError {
 
 #[derive(Debug)]
 pub enum SchemaItem {
+    #[allow(dead_code)]
     Collection(Box<SchemaItem>),
     Document(HashMap<String, SchemaItem>),
     Scalar,
@@ -90,13 +87,13 @@ const USIZE_LEN: usize = std::mem::size_of::<usize>();
 #[cfg(test)]
 mod tests {
 
-    use crate::message::Ref;
+    use crate::{message::Ref, schema::SchemaItem};
 
     use super::Schema;
 
     #[test]
     fn round_trip_ref() {
-        let schema = Schema::empty();
+        let schema = Schema::new(SchemaItem::Scalar);
         let r = Ref(vec![
             "apple".to_string(),
             "banana".to_string(),

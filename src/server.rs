@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use futures_util::{FutureExt, Stream};
 use serde_json::{Map, Value};
@@ -64,7 +64,7 @@ impl Server {
         }
     }
 
-    pub fn set(&self, key: &Ref, val: &Value) -> Result<(), ServerError> {
+    pub fn set(&self, key: &Ref, val: Value) -> Result<(), ServerError> {
         let schema = dbg!(self.schema.resolve(&key.0)?);
         match schema {
             SchemaItem::Collection(_) => todo!("return error: can't set a collection?"),
@@ -148,11 +148,12 @@ mod tests {
     use std::sync::Arc;
 
     use futures_util::StreamExt;
+    use serde_json::Value;
     use sled::Config;
 
     use crate::{
-        message::{Ref, RefComponent},
-        schema::Schema,
+        message::Ref,
+        schema::{Schema, SchemaItem},
         server::Event,
     };
 
@@ -165,24 +166,40 @@ mod tests {
             .open()
             .unwrap();
 
+        let test_schema = Schema::new(SchemaItem::Document(
+            [(
+                "hello".to_string(),
+                SchemaItem::Document(
+                    [
+                        ("world".to_string(), SchemaItem::Scalar),
+                        ("new york".to_string(), SchemaItem::Scalar),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+            )]
+            .into_iter()
+            .collect(),
+        ));
+
         Server {
             store: db,
-            schema: Arc::new(Schema::empty()),
+            schema: Arc::new(test_schema),
         }
     }
 
     #[test]
     fn values() {
         let server = test_server();
-        let r = Ref(vec![RefComponent::Document("hello".to_string())]);
-        server.set(&r, Some("world")).unwrap();
-        assert_eq!(server.get(&r).unwrap(), Some("world".to_string()));
+        let r = Ref(vec!["hello".to_string(), "world".to_string()]);
+        server.set(&r, Value::String("value".to_string())).unwrap();
+        assert_eq!(server.get(&r).unwrap().as_str().unwrap(), "value");
     }
 
     #[tokio::test]
     async fn subscription() {
         let server = test_server();
-        let r = Ref(vec![RefComponent::Document("value".to_string())]);
+        let r = Ref(vec!["hello".to_string(), "world".to_string()]);
 
         let mut subscription = server.subscribe(&r);
 
@@ -192,7 +209,7 @@ mod tests {
         let r_ = r.clone();
         let handle = tokio::spawn(async move {
             for i in 0..count_up_to {
-                write_server.set(&r_, Some(i.to_string().as_str())).unwrap();
+                write_server.set(&r_, Value::String(i.to_string())).unwrap();
             }
         });
 
