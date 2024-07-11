@@ -11,12 +11,13 @@
   <script type="module">
     async function main() {
       const client = await IceloadClient.connect('ws://localhost:9002');
-      client.subscribe("hello", (val) => {
+      client.subscribe([{ col: "hello" }], (val) => {
         console.log(val);
       });
-      client.set("hello", "1");
-      client.set("hello", "2");
-      client.set("hello", "3");
+      const docRef = [{col: "hello" }, {doc: "world"}];
+      client.set(docRef, "1");
+      client.set(docRef, "2");
+      client.set(docRef, "3");
     }
     main();
   </script>

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use futures_util::{SinkExt, StreamExt};
+use schema::Schema;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{
     accept_async,
@@ -9,15 +10,18 @@ use tokio_tungstenite::{
 
 mod message;
 use message::{ClientMessage, ServerMessage};
+mod schema;
 mod server;
 use server::Server;
+
+use crate::server::Event;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let addr = "127.0.0.1:9002";
     let listener = TcpListener::bind(&addr).await?;
 
-    let server = Server::open("data")?;
+    let server = Server::open("data", Schema::empty())?;
 
     while let Ok((stream, _)) = listener.accept().await {
         let server = server.clone();
@@ -56,29 +60,29 @@ async fn client_task(server: Server, stream: TcpStream) -> anyhow::Result<()> {
         let msg: ClientMessage = serde_json::from_str(msg)?;
         match msg {
             ClientMessage::Get(key) => {
-                let value = server.get(key.as_str()).unwrap();
+                let value = server.get(&key).unwrap();
                 println!("Get result {value:?}");
                 send_resp.send(ServerMessage::Value(value)).unwrap();
             }
             ClientMessage::Set(key, value) => {
-                let value = server.set(key.as_str(), value.as_deref()).unwrap();
+                let value = server.set(&key, value.as_deref()).unwrap();
                 println!("Set result {value:?}");
                 send_resp.send(ServerMessage::Value(value)).unwrap();
             }
             ClientMessage::Subscribe(key) => {
-                let mut subscriber = server.subscribe(key.as_str());
+                let mut subscriber = server.subscribe(&key);
                 let sender = send_resp.clone();
                 let key_ = key.clone();
                 let handle = tokio::spawn(async move {
                     while let Some(event) = subscriber.next().await {
                         match event {
-                            sled::Event::Insert { key: _, value } => {
+                            Event::Insert { key: _, value } => {
                                 let value = String::from_utf8(value.to_vec()).unwrap();
                                 sender
                                     .send(ServerMessage::ValueChanged(key_.clone(), Some(value)))
                                     .unwrap();
                             }
-                            sled::Event::Remove { key: _ } => {
+                            Event::Remove { key: _ } => {
                                 sender
                                     .send(ServerMessage::ValueChanged(key_.clone(), None))
                                     .unwrap();

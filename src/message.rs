@@ -4,14 +4,25 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Serialize)]
 pub enum ClientMessage {
-    Get(String),
-    Set(String, Option<String>),
-    Subscribe(String),
-    Unsubscribe(String),
+    Get(Ref),
+    Set(Ref, Option<String>),
+    Subscribe(Ref),
+    Unsubscribe(Ref),
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 pub enum ServerMessage {
     Value(Option<String>),
-    ValueChanged(String, Option<String>),
+    ValueChanged(Ref, Option<String>),
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Ref(pub Vec<RefComponent>);
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, Deserialize, Serialize)]
+pub enum RefComponent {
+    #[serde(rename = "col")]
+    Collection(String),
+    #[serde(rename = "doc")]
+    Document(String),
 }

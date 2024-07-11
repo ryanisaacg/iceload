@@ -1,6 +1,10 @@
+use std::sync::Arc;
+
 use futures_util::{FutureExt, Stream};
-use sled::{Db, Event, Subscriber};
+use sled::{Db, IVec, Subscriber};
 use thiserror::Error;
+
+use crate::{message::Ref, schema::Schema};
 
 #[derive(Debug, Error)]
 pub enum ServerError {
@@ -11,16 +15,22 @@ pub enum ServerError {
 #[derive(Clone)]
 pub struct Server {
     store: Db,
+    schema: Arc<Schema>,
 }
 
 impl Server {
-    pub fn open(path: &str) -> Result<Server, ServerError> {
+    // TODO: read the schema out of the store
+    pub fn open(path: &str, schema: Schema) -> Result<Server, ServerError> {
         let store = sled::open(path)?;
-        Ok(Server { store })
+        Ok(Server {
+            store,
+            schema: Arc::new(schema),
+        })
     }
 
-    pub fn get(&self, key: &str) -> Result<Option<String>, ServerError> {
-        Ok(match self.store.get(key.as_bytes())? {
+    pub fn get(&self, key: &Ref) -> Result<Option<String>, ServerError> {
+        let encoded_ref = self.schema.encode_ref(&key.0);
+        Ok(match self.store.get(&encoded_ref)? {
             Some(val) => {
                 let val = val.to_vec();
                 let string = String::from_utf8(val).expect("string value");
@@ -30,23 +40,43 @@ impl Server {
         })
     }
 
-    pub fn set(&self, key: &str, val: Option<&str>) -> Result<Option<String>, ServerError> {
+    pub fn set(&self, key: &Ref, val: Option<&str>) -> Result<Option<String>, ServerError> {
+        let encoded_ref = self.schema.encode_ref(&key.0);
         let val = match val {
-            Some(val) => self.store.insert(key.as_bytes(), val.as_bytes())?,
-            None => self.store.remove(key.as_bytes())?,
+            Some(val) => self.store.insert(&encoded_ref, val.as_bytes())?,
+            None => self.store.remove(&encoded_ref)?,
         };
         Ok(val.map(|val| String::from_utf8(val.to_vec()).expect("string value")))
     }
 
-    pub fn subscribe(&self, key: &str) -> SubscriptionStream {
+    pub fn subscribe(&self, key: &Ref) -> SubscriptionStream {
+        let encoded_ref = self.schema.encode_ref(&key.0);
         SubscriptionStream {
-            sub: self.store.watch_prefix(key.as_bytes()),
+            sub: self.store.watch_prefix(&encoded_ref),
+            schema: self.schema.clone(),
         }
     }
 }
 
 pub struct SubscriptionStream {
     sub: Subscriber,
+    schema: Arc<Schema>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Event {
+    /// A new complete (key, value) pair
+    Insert {
+        /// The key that has been set
+        key: Ref,
+        /// The value that has been set
+        value: IVec,
+    },
+    /// A deleted key
+    Remove {
+        /// The key that has been removed
+        key: Ref,
+    },
 }
 
 impl Stream for SubscriptionStream {
@@ -56,14 +86,32 @@ impl Stream for SubscriptionStream {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        self.sub.poll_unpin(cx)
+        self.sub.poll_unpin(cx).map(|evt| {
+            evt.map(|evt| match evt {
+                sled::Event::Insert { key, value } => Event::Insert {
+                    key: Ref(self.schema.decode_ref(key.as_ref())),
+                    value,
+                },
+                sled::Event::Remove { key } => Event::Remove {
+                    key: Ref(self.schema.decode_ref(key.as_ref())),
+                },
+            })
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use futures_util::StreamExt;
-    use sled::{Config, Event};
+    use sled::Config;
+
+    use crate::{
+        message::{Ref, RefComponent},
+        schema::Schema,
+        server::Event,
+    };
 
     use super::Server;
 
@@ -74,30 +122,34 @@ mod tests {
             .open()
             .unwrap();
 
-        Server { store: db }
+        Server {
+            store: db,
+            schema: Arc::new(Schema::empty()),
+        }
     }
 
     #[test]
     fn values() {
         let server = test_server();
-        server.set("hello", Some("world")).unwrap();
-        assert_eq!(server.get("hello").unwrap(), Some("world".to_string()));
+        let r = Ref(vec![RefComponent::Document("hello".to_string())]);
+        server.set(&r, Some("world")).unwrap();
+        assert_eq!(server.get(&r).unwrap(), Some("world".to_string()));
     }
 
     #[tokio::test]
     async fn subscription() {
         let server = test_server();
+        let r = Ref(vec![RefComponent::Document("value".to_string())]);
 
-        let mut subscription = server.subscribe("value");
+        let mut subscription = server.subscribe(&r);
 
         let count_up_to = 5;
 
         let write_server = server.clone();
+        let r_ = r.clone();
         let handle = tokio::spawn(async move {
             for i in 0..count_up_to {
-                write_server
-                    .set("value", Some(i.to_string().as_str()))
-                    .unwrap();
+                write_server.set(&r_, Some(i.to_string().as_str())).unwrap();
             }
         });
 
@@ -106,7 +158,7 @@ mod tests {
             let Event::Insert { key, value } = event else {
                 panic!("expected insert event");
             };
-            assert_eq!(std::str::from_utf8(key.as_ref()), Ok("value"));
+            assert_eq!(&key, &r);
             assert_eq!(String::from_utf8(value.to_vec()), Ok(expected.to_string()));
 
             expected += 1;
