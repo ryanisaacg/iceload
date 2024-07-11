@@ -1,15 +1,23 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use futures_util::{FutureExt, Stream};
+use serde_json::{Map, Value};
 use sled::{Db, IVec, Subscriber};
 use thiserror::Error;
 
-use crate::{message::Ref, schema::Schema};
+use crate::{
+    message::Ref,
+    schema::{Schema, SchemaItem, SchemaResolutionError},
+};
 
 #[derive(Debug, Error)]
 pub enum ServerError {
     #[error("{}", .0)]
     SledError(#[from] sled::Error),
+    #[error("{}", .0)]
+    SchemaError(#[from] SchemaResolutionError),
+    #[error("key not found")]
+    KeyNotFound,
 }
 
 #[derive(Clone)]
@@ -28,25 +36,60 @@ impl Server {
         })
     }
 
-    pub fn get(&self, key: &Ref) -> Result<Option<String>, ServerError> {
-        let encoded_ref = self.schema.encode_ref(&key.0);
-        Ok(match self.store.get(&encoded_ref)? {
-            Some(val) => {
-                let val = val.to_vec();
-                let string = String::from_utf8(val).expect("string value");
-                Some(string)
+    pub fn get(&self, key: &Ref) -> Result<Value, ServerError> {
+        let schema = self.schema.resolve(&key.0)?;
+        match schema {
+            SchemaItem::Collection(_) => todo!("getting a collection"),
+            SchemaItem::Document(fields) => {
+                let mut values = Map::new();
+                for field in fields.keys() {
+                    let mut sub_key = key.clone();
+                    sub_key.0.push(field.clone());
+                    let sub_value = self.get(&sub_key)?;
+                    values.insert(sub_key.0.pop().unwrap(), sub_value);
+                }
+                Ok(Value::Object(values))
             }
-            None => None,
-        })
+            SchemaItem::Scalar => {
+                let encoded_ref = self.schema.encode_ref(&key.0);
+                match self.store.get(&encoded_ref)? {
+                    Some(val) => {
+                        let val = val.to_vec();
+                        let string = String::from_utf8(val).expect("string value");
+                        Ok(Value::String(string))
+                    }
+                    None => Err(ServerError::KeyNotFound),
+                }
+            }
+        }
     }
 
-    pub fn set(&self, key: &Ref, val: Option<&str>) -> Result<Option<String>, ServerError> {
-        let encoded_ref = self.schema.encode_ref(&key.0);
-        let val = match val {
-            Some(val) => self.store.insert(&encoded_ref, val.as_bytes())?,
-            None => self.store.remove(&encoded_ref)?,
-        };
-        Ok(val.map(|val| String::from_utf8(val.to_vec()).expect("string value")))
+    pub fn set(&self, key: &Ref, val: &Value) -> Result<(), ServerError> {
+        let schema = dbg!(self.schema.resolve(&key.0)?);
+        match schema {
+            SchemaItem::Collection(_) => todo!("return error: can't set a collection?"),
+            SchemaItem::Document(_) => todo!(),
+            SchemaItem::Scalar => {
+                let Value::String(val) = val else { todo!() };
+                let encoded_ref = self.schema.encode_ref(&key.0);
+                self.store.insert(&encoded_ref, val.as_bytes())?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn remove(&self, key: &Ref) -> Result<(), ServerError> {
+        let schema = self.schema.resolve(&key.0)?;
+        match schema {
+            SchemaItem::Collection(_) => todo!("return error: can't remove a collection?"),
+            SchemaItem::Document(_) => todo!(),
+            SchemaItem::Scalar => {
+                let encoded_ref = self.schema.encode_ref(&key.0);
+                self.store.remove(&encoded_ref)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn subscribe(&self, key: &Ref) -> SubscriptionStream {

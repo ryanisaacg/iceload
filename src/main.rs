@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use futures_util::{SinkExt, StreamExt};
-use schema::Schema;
+use schema::{Schema, SchemaItem};
+use serde_json::Value;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{
     accept_async,
@@ -21,7 +22,23 @@ async fn main() -> anyhow::Result<()> {
     let addr = "127.0.0.1:9002";
     let listener = TcpListener::bind(&addr).await?;
 
-    let server = Server::open("data", Schema::empty())?;
+    let test_schema = Schema::create(SchemaItem::Document(
+        [(
+            "hello".to_string(),
+            SchemaItem::Document(
+                [
+                    ("world".to_string(), SchemaItem::Scalar),
+                    ("new york".to_string(), SchemaItem::Scalar),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        )]
+        .into_iter()
+        .collect(),
+    ));
+
+    let server = Server::open("data", test_schema)?;
 
     while let Ok((stream, _)) = listener.accept().await {
         let server = server.clone();
@@ -64,11 +81,18 @@ async fn client_task(server: Server, stream: TcpStream) -> anyhow::Result<()> {
                 println!("Get result {value:?}");
                 send_resp.send(ServerMessage::Value(value)).unwrap();
             }
-            ClientMessage::Set(key, value) => {
-                let value = server.set(&key, value.as_deref()).unwrap();
-                println!("Set result {value:?}");
-                send_resp.send(ServerMessage::Value(value)).unwrap();
-            }
+            ClientMessage::Set(key, value) => match server.set(&key, &value) {
+                Ok(_) => send_resp.send(ServerMessage::Value(Value::Null)).unwrap(),
+                Err(e) => send_resp
+                    .send(ServerMessage::Error(format!("{e}")))
+                    .unwrap(),
+            },
+            ClientMessage::Remove(key) => match server.remove(&key) {
+                Ok(_) => send_resp.send(ServerMessage::Value(Value::Null)).unwrap(),
+                Err(e) => send_resp
+                    .send(ServerMessage::Error(format!("{e}")))
+                    .unwrap(),
+            },
             ClientMessage::Subscribe(key) => {
                 let mut subscriber = server.subscribe(&key);
                 let sender = send_resp.clone();
@@ -79,12 +103,15 @@ async fn client_task(server: Server, stream: TcpStream) -> anyhow::Result<()> {
                             Event::Insert { key: _, value } => {
                                 let value = String::from_utf8(value.to_vec()).unwrap();
                                 sender
-                                    .send(ServerMessage::ValueChanged(key_.clone(), Some(value)))
+                                    .send(ServerMessage::SubscriptionUpdate(
+                                        key_.clone(),
+                                        Some(value),
+                                    ))
                                     .unwrap();
                             }
                             Event::Remove { key: _ } => {
                                 sender
-                                    .send(ServerMessage::ValueChanged(key_.clone(), None))
+                                    .send(ServerMessage::SubscriptionUpdate(key_.clone(), None))
                                     .unwrap();
                             }
                         }
