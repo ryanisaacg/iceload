@@ -63,6 +63,11 @@ impl Server {
                 Ok(Value::Object(result))
             }
             SchemaItem::Document(fields) => {
+                let encoded_ref = self.schema.encode_ref(&key.0);
+                if !self.store.contains_key(&encoded_ref)? {
+                    return Ok(Value::Null);
+                }
+
                 let mut values = Map::new();
                 for field in fields.keys() {
                     let mut sub_key = key.clone();
@@ -492,6 +497,14 @@ mod tests {
 
         let all_fruits = server.get(&create_ref(&["fruits"])).unwrap();
         assert_eq!(all_fruits, Value::Object(Map::new()));
+    }
+
+    #[test]
+    fn legal_but_not_found() {
+        let server = document_server();
+
+        let value = server.get(&create_ref(&["hello"])).unwrap();
+        assert_eq!(value, Value::Null);
     }
 
     fn collection_server() -> Server {
