@@ -2,7 +2,12 @@ use std::{collections::HashSet, sync::Arc};
 
 use futures_util::{FutureExt, Stream};
 use serde_json::{Map, Value};
-use sled::{Db, IVec, Subscriber};
+use sled::{
+    transaction::{
+        abort, ConflictableTransactionError, TransactionError, TransactionResult, TransactionalTree,
+    },
+    Db, IVec, Subscriber,
+};
 use thiserror::Error;
 
 use crate::{
@@ -95,84 +100,16 @@ impl Server {
         let schema = self.schema.resolve(&key.0)?;
         match schema {
             SchemaItem::Document(_) | SchemaItem::Collection(_) => {
-                self.insert_internal(key, schema, val)
+                tx_result(self.store.transaction(move |tx_db| {
+                    let tx_handler = TransactionHandler {
+                        store: tx_db,
+                        schema: &self.schema,
+                    };
+                    tx_handler.insert_internal(key, schema, &val)
+                }))
             }
             SchemaItem::Scalar => Err(ServerError::NonDocumentInsert),
         }
-    }
-
-    fn insert_internal(
-        &self,
-        key: &Ref,
-        schema: &SchemaItem,
-        val: Value,
-    ) -> Result<(), ServerError> {
-        // TODO: transactional
-        match schema {
-            SchemaItem::Collection(inner) => {
-                let Value::Object(obj) = val else {
-                    return Err(ServerError::SchemaMismatch);
-                };
-                for (primary_key, value) in obj {
-                    let mut sub_key = key.clone();
-                    sub_key.0.push(primary_key);
-                    self.insert_internal(&sub_key, inner, value)?;
-                }
-            }
-            SchemaItem::Document(fields) => {
-                // TODO: optimize # of loops
-                let Value::Object(obj) = val else {
-                    return Err(ServerError::SchemaMismatch);
-                };
-                for entry in obj.keys() {
-                    if !fields.contains_key(entry) {
-                        return Err(ServerError::ExtraKeyFound);
-                    }
-                }
-                for field in fields.keys() {
-                    if !obj.contains_key(field) {
-                        return Err(ServerError::SchemaMismatch);
-                    }
-                }
-                let encoded_ref = self.schema.encode_ref(&key.0);
-                self.store.insert(&encoded_ref, &[1])?;
-                for (obj_key, obj_value) in obj {
-                    let field = &fields[&obj_key];
-                    let mut sub_key = key.clone();
-                    sub_key.0.push(obj_key);
-                    self.insert_internal(&sub_key, field, obj_value)?;
-                }
-            }
-            SchemaItem::Scalar => {
-                let Value::String(val) = val else {
-                    return Err(ServerError::SchemaMismatch);
-                };
-                let encoded_ref = self.schema.encode_ref(&key.0);
-                self.store.insert(&encoded_ref, val.as_bytes())?;
-            }
-        }
-
-        if key.0.len() > 1 {
-            let parent_ref = &key.0[..key.0.len() - 1];
-            let parent_schema = self.schema.resolve(parent_ref)?;
-            if let SchemaItem::Collection(_) = parent_schema {
-                let encoded_collection_key = self.schema.encode_ref(parent_ref);
-                let mut keys: HashSet<String> = self
-                    .store
-                    .get(&encoded_collection_key)?
-                    .map(|collection_value| {
-                        bincode::deserialize(collection_value.as_ref()).expect("keys are bincoded")
-                    })
-                    .unwrap_or(HashSet::new());
-                if !keys.contains(key.0.last().unwrap()) {
-                    keys.insert(key.0.last().unwrap().clone());
-                    let keys_encoded = bincode::serialize(&keys).unwrap();
-                    self.store.insert(&encoded_collection_key, keys_encoded)?;
-                }
-            }
-        }
-
-        Ok(())
     }
 
     pub fn update(&self, key: &Ref, val: Value) -> Result<(), ServerError> {
@@ -285,6 +222,99 @@ impl Server {
             sub: self.store.watch_prefix(&encoded_ref),
             schema: self.schema.clone(),
         }
+    }
+}
+
+struct TransactionHandler<'a> {
+    store: &'a TransactionalTree,
+    schema: &'a Schema,
+}
+
+impl TransactionHandler<'_> {
+    fn insert_internal(
+        &self,
+        key: &Ref,
+        schema: &SchemaItem,
+        val: &Value,
+    ) -> Result<(), ConflictableTransactionError<ServerError>> {
+        // TODO: transactional
+        match schema {
+            SchemaItem::Collection(inner) => {
+                let Value::Object(obj) = val else {
+                    return abort(ServerError::SchemaMismatch);
+                };
+                for (primary_key, value) in obj {
+                    let mut sub_key = key.clone();
+                    sub_key.0.push(primary_key.clone());
+                    self.insert_internal(&sub_key, inner, value)?;
+                }
+            }
+            SchemaItem::Document(fields) => {
+                // TODO: optimize # of loops
+                let Value::Object(obj) = val else {
+                    return abort(ServerError::SchemaMismatch);
+                };
+                for entry in obj.keys() {
+                    if !fields.contains_key(entry) {
+                        return abort(ServerError::ExtraKeyFound);
+                    }
+                }
+                for field in fields.keys() {
+                    if !obj.contains_key(field) {
+                        return abort(ServerError::SchemaMismatch);
+                    }
+                }
+                let encoded_ref = self.schema.encode_ref(&key.0);
+                self.store.insert(&encoded_ref[..], &[1])?;
+                for (obj_key, obj_value) in obj {
+                    let field = &fields[obj_key];
+                    let mut sub_key = key.clone();
+                    sub_key.0.push(obj_key.clone());
+                    self.insert_internal(&sub_key, field, obj_value)?;
+                }
+            }
+            SchemaItem::Scalar => {
+                let Value::String(val) = val else {
+                    return abort(ServerError::SchemaMismatch);
+                };
+                let encoded_ref = self.schema.encode_ref(&key.0);
+                self.store.insert(&encoded_ref[..], val.as_bytes())?;
+            }
+        }
+
+        if key.0.len() > 1 {
+            let parent_ref = &key.0[..key.0.len() - 1];
+            let parent_schema = match self.schema.resolve(parent_ref) {
+                Ok(schema) => schema,
+                Err(err) => return abort(err.into()),
+            };
+            if let SchemaItem::Collection(_) = parent_schema {
+                let encoded_collection_key = self.schema.encode_ref(parent_ref);
+                let mut keys: HashSet<String> = self
+                    .store
+                    .get(&encoded_collection_key)?
+                    .map(|collection_value| {
+                        bincode::deserialize(collection_value.as_ref()).expect("keys are bincoded")
+                    })
+                    .unwrap_or(HashSet::new());
+                if !keys.contains(key.0.last().unwrap()) {
+                    keys.insert(key.0.last().unwrap().clone());
+                    let keys_encoded = bincode::serialize(&keys).unwrap();
+                    self.store
+                        .insert(&encoded_collection_key[..], keys_encoded)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn tx_result<T>(result: TransactionResult<T, ServerError>) -> Result<T, ServerError> {
+    match result {
+        Ok(val) => Ok(val),
+        Err(TransactionError::Abort(e)) => Err(e),
+        Err(TransactionError::Storage(e)) => Err(e.into()),
     }
 }
 
@@ -502,6 +532,20 @@ mod tests {
     #[test]
     fn legal_but_not_found() {
         let server = document_server();
+
+        let value = server.get(&create_ref(&["hello"])).unwrap();
+        assert_eq!(value, Value::Null);
+    }
+
+    #[test]
+    fn transactional_inserts() {
+        let server = document_server();
+
+        let mut obj = Map::new();
+        obj.insert("world".to_string(), "1".into());
+        obj.insert("new york".to_string(), Value::Array(vec![])); // doesn't match schema
+        let result = server.insert(&create_ref(&["hello"]), Value::Object(obj));
+        assert!(result.is_err());
 
         let value = server.get(&create_ref(&["hello"])).unwrap();
         assert_eq!(value, Value::Null);
