@@ -14,9 +14,10 @@
       client.subscribe(["hello"], (val) => {
         console.log(val);
       });
-      await client.set(["hello", "world"], "1");
-      await client.set(["hello", "new york"], "2");
-      await client.set(["hello", "world"], "3");
+      await client.insert(["hello"], { world: "0", ["new york"]: "0" });
+      await client.update(["hello", "world"], "1");
+      await client.update(["hello", "new york"], "2");
+      await client.update(["hello", "world"], "3");
     }
     main();
   </script>

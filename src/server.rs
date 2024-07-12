@@ -86,7 +86,6 @@ impl Server {
         }
     }
 
-    // TODO: back off mutations if schema fails to match
     pub fn insert(&self, key: &Ref, val: Value) -> Result<(), ServerError> {
         let schema = self.schema.resolve(&key.0)?;
         match schema {
@@ -130,6 +129,8 @@ impl Server {
                         return Err(ServerError::SchemaMismatch);
                     }
                 }
+                let encoded_ref = self.schema.encode_ref(&key.0);
+                self.store.insert(&encoded_ref, &[1])?;
                 for (obj_key, obj_value) in obj {
                     let field = &fields[&obj_key];
                     let mut sub_key = key.clone();
@@ -169,6 +170,57 @@ impl Server {
         Ok(())
     }
 
+    pub fn update(&self, key: &Ref, val: Value) -> Result<(), ServerError> {
+        // TODO: transactional
+        let schema = self.schema.resolve(&key.0)?;
+        match schema {
+            SchemaItem::Collection(_inner) => {
+                let Value::Object(obj) = val else {
+                    return Err(ServerError::SchemaMismatch);
+                };
+                let encoded_ref = self.schema.encode_ref(&key.0);
+                if !self.store.contains_key(&encoded_ref)? {
+                    return Err(ServerError::KeyNotFound);
+                }
+                for (primary_key, value) in obj {
+                    let mut sub_key = key.clone();
+                    sub_key.0.push(primary_key);
+                    self.update(&sub_key, value)?;
+                }
+            }
+            SchemaItem::Document(fields) => {
+                let Value::Object(obj) = val else {
+                    return Err(ServerError::SchemaMismatch);
+                };
+                let encoded_ref = self.schema.encode_ref(&key.0);
+                self.store.remove(&encoded_ref)?;
+                if !self.store.contains_key(encoded_ref)? {
+                    return Err(ServerError::KeyNotFound);
+                }
+                for (obj_key, obj_value) in obj {
+                    if !fields.contains_key(&obj_key) {
+                        return Err(ServerError::ExtraKeyFound);
+                    }
+                    let mut sub_key = key.clone();
+                    sub_key.0.push(obj_key);
+                    self.update(&sub_key, obj_value)?;
+                }
+            }
+            SchemaItem::Scalar => {
+                let Value::String(val) = val else {
+                    return Err(ServerError::SchemaMismatch);
+                };
+                let encoded_ref = self.schema.encode_ref(&key.0);
+                if !self.store.contains_key(&encoded_ref)? {
+                    return Err(ServerError::KeyNotFound);
+                }
+                self.store.insert(&encoded_ref, val.as_bytes())?;
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn remove(&self, key: &Ref) -> Result<(), ServerError> {
         // TODO: transactional
         let schema = self.schema.resolve(&key.0)?;
@@ -188,6 +240,8 @@ impl Server {
                 self.store.remove(&encoded_ref)?;
             }
             SchemaItem::Document(fields) => {
+                let encoded_ref = self.schema.encode_ref(&key.0);
+                self.store.remove(&encoded_ref)?;
                 for field in fields.keys() {
                     let mut sub_key = key.clone();
                     sub_key.0.push(field.clone());
@@ -306,7 +360,7 @@ mod tests {
         );
     }
 
-    /*#[tokio::test]
+    #[tokio::test]
     async fn subscription() {
         let server = document_server();
         server
@@ -326,7 +380,7 @@ mod tests {
         let handle = tokio::spawn(async move {
             for i in 0..count_up_to {
                 write_server
-                    .insert(&r_, Value::String(i.to_string()))
+                    .update(&r_, Value::String(i.to_string()))
                     .unwrap();
             }
         });
@@ -346,7 +400,7 @@ mod tests {
         }
 
         handle.await.unwrap();
-    }*/
+    }
 
     #[test]
     fn set_object() {

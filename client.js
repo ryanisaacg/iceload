@@ -42,8 +42,13 @@ class IceloadClient {
     return await this.#wait_next_value();
   }
 
-  async set(key, value) {
-    this.socket.send(JSON.stringify({ Set: [key, value] }));
+  async insert(key, value) {
+    this.socket.send(JSON.stringify({ Insert: [key, value] }));
+    return await this.#wait_next_value();
+  }
+
+  async update(key, value) {
+    this.socket.send(JSON.stringify({ Update: [key, value] }));
     return await this.#wait_next_value();
   }
 
