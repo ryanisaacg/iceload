@@ -10,6 +10,7 @@ use crate::{
     schema::{Schema, SchemaItem, SchemaResolutionError},
 };
 
+// TODO: error context
 #[derive(Debug, Error)]
 pub enum ServerError {
     #[error("{}", .0)]
@@ -43,7 +44,22 @@ impl Server {
     pub fn get(&self, key: &Ref) -> Result<Value, ServerError> {
         let schema = self.schema.resolve(&key.0)?;
         match schema {
-            SchemaItem::Collection(_) => todo!("getting a collection"),
+            SchemaItem::Collection(_inner) => {
+                let encoded_ref = self.schema.encode_ref(&key.0);
+                let Some(value) = self.store.get(&encoded_ref)? else {
+                    return Err(ServerError::KeyNotFound);
+                };
+                let keys: Vec<String> = bincode::deserialize(value.as_ref())
+                    .expect("collections are encoded via bincode");
+                let mut result = Map::new();
+                for child in keys {
+                    let mut sub_key = key.clone();
+                    sub_key.0.push(child.clone());
+                    let sub_value = self.get(&sub_key)?;
+                    result.insert(sub_key.0.pop().unwrap(), sub_value);
+                }
+                Ok(Value::Object(result))
+            }
             SchemaItem::Document(fields) => {
                 let mut values = Map::new();
                 for field in fields.keys() {
@@ -70,7 +86,6 @@ impl Server {
 
     // TODO: back off mutations if schema fails to match
     pub fn set(&self, key: &Ref, val: Value) -> Result<(), ServerError> {
-        //let parent_schema = self.schema.resolve(&key.0[..key.0.len() - 1])?;
         let schema = self.schema.resolve(&key.0)?;
         match schema {
             SchemaItem::Collection(_) => todo!("return error: can't set a collection?"),
@@ -101,6 +116,26 @@ impl Server {
                 };
                 let encoded_ref = self.schema.encode_ref(&key.0);
                 self.store.insert(&encoded_ref, val.as_bytes())?;
+            }
+        }
+
+        if key.0.len() > 1 {
+            let parent_ref = &key.0[..key.0.len() - 1];
+            let parent_schema = self.schema.resolve(parent_ref)?;
+            if let SchemaItem::Collection(_) = parent_schema {
+                let encoded_collection_key = self.schema.encode_ref(parent_ref);
+                let mut keys: Vec<String> = self
+                    .store
+                    .get(&encoded_collection_key)?
+                    .map(|collection_value| {
+                        bincode::deserialize(collection_value.as_ref()).expect("keys are bincoded")
+                    })
+                    .unwrap_or(Vec::new());
+                if !keys.contains(key.0.last().unwrap()) {
+                    keys.push(key.0.last().unwrap().clone());
+                    let keys_encoded = bincode::serialize(&keys).unwrap();
+                    self.store.insert(&encoded_collection_key, keys_encoded)?;
+                }
             }
         }
 
@@ -216,10 +251,26 @@ mod tests {
         }
     }
 
+    fn create_ref(components: &[&str]) -> Ref {
+        Ref(components
+            .iter()
+            .map(|component| component.to_string())
+            .collect())
+    }
+
+    fn map<T: Clone + Into<Value>>(items: &[(&str, T)]) -> Value {
+        Value::Object(
+            items
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.clone().into()))
+                .collect(),
+        )
+    }
+
     #[test]
     fn values() {
         let server = test_server();
-        let r = Ref(vec!["hello".to_string(), "world".to_string()]);
+        let r = create_ref(&["hello", "world"]);
         server.set(&r, Value::String("value".to_string())).unwrap();
         assert_eq!(server.get(&r).unwrap().as_str().unwrap(), "value");
     }
@@ -227,7 +278,7 @@ mod tests {
     #[tokio::test]
     async fn subscription() {
         let server = test_server();
-        let r = Ref(vec!["hello".to_string(), "world".to_string()]);
+        let r = create_ref(&["hello", "world"]);
 
         let mut subscription = server.subscribe(&r);
 
@@ -262,26 +313,15 @@ mod tests {
     fn set_object() {
         let server = test_server();
         let r = Ref(vec!["hello".to_string()]);
-        let obj = Value::Object(
-            [
-                ("world".to_string(), Value::String("1".to_string())),
-                ("new york".to_string(), Value::String("2".to_string())),
-            ]
-            .into_iter()
-            .collect(),
-        );
+        let obj = map(&[("world", "1"), ("new york", "2")]);
         server.set(&r, obj).unwrap();
 
         assert_eq!(
-            server
-                .get(&Ref(vec!["hello".to_string(), "world".to_string()]))
-                .unwrap(),
+            server.get(&create_ref(&["hello", "world"])).unwrap(),
             Value::String("1".to_string()),
         );
         assert_eq!(
-            server
-                .get(&Ref(vec!["hello".to_string(), "new york".to_string()]))
-                .unwrap(),
+            server.get(&create_ref(&["hello", "new york"])).unwrap(),
             Value::String("2".to_string()),
         );
     }
@@ -290,17 +330,52 @@ mod tests {
     fn get_object() {
         let server = test_server();
         let r = Ref(vec!["hello".to_string()]);
-        let obj = Value::Object(
-            [
-                ("world".to_string(), Value::String("1".to_string())),
-                ("new york".to_string(), Value::String("2".to_string())),
-            ]
-            .into_iter()
-            .collect(),
-        );
+        let obj = map(&[("world", "1"), ("new york", "2")]);
         server.set(&r, obj.clone()).unwrap();
         let result_obj = server.get(&Ref(vec!["hello".to_string()])).unwrap();
 
         assert_eq!(obj, result_obj);
+    }
+
+    #[test]
+    fn get_collection() {
+        let mut server = test_server();
+        server.schema = Arc::new(Schema::new(SchemaItem::Document(
+            [(
+                "fruits".to_string(),
+                SchemaItem::Collection(Box::new(SchemaItem::Document(
+                    [("color".to_string(), SchemaItem::Scalar)]
+                        .into_iter()
+                        .collect(),
+                ))),
+            )]
+            .into_iter()
+            .collect(),
+        )));
+
+        server
+            .set(&create_ref(&["fruits", "apple"]), map(&[("color", "red")]))
+            .unwrap();
+        server
+            .set(
+                &create_ref(&["fruits", "banana"]),
+                map(&[("color", "yellow")]),
+            )
+            .unwrap();
+        server
+            .set(
+                &create_ref(&["fruits", "blueberry"]),
+                map(&[("color", "purple")]),
+            )
+            .unwrap();
+        let all_fruits = server.get(&create_ref(&["fruits"])).unwrap();
+        assert_eq!(
+            all_fruits,
+            map(&[
+                ("apple", map(&[("color", "red")])),
+                ("banana", map(&[("color", "yellow")])),
+                ("blueberry", map(&[("color", "purple")])),
+            ])
+        );
     }
 }
