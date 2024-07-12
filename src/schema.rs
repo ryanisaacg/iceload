@@ -4,8 +4,6 @@ use thiserror::Error;
 
 use crate::message::RefComponent;
 
-// TODO: in the future the schema will be aware of the shape of the database,
-// allowing it to construct much more efficient keys from refs
 pub struct Schema(SchemaItem);
 
 impl Schema {
@@ -13,6 +11,7 @@ impl Schema {
         Schema(root)
     }
 
+    // TODO: more efficient encoding format (e.g. dependent on field ordering?)
     pub fn encode_ref(&self, refs: &[RefComponent]) -> Vec<u8> {
         let mut encoded = Vec::new();
 
