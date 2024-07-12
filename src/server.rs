@@ -100,120 +100,20 @@ impl Server {
         let schema = self.schema.resolve(&key.0)?;
         match schema {
             SchemaItem::Document(_) | SchemaItem::Collection(_) => {
-                tx_result(self.store.transaction(move |tx_db| {
-                    let tx_handler = TransactionHandler {
-                        store: tx_db,
-                        schema: &self.schema,
-                    };
-                    tx_handler.insert_internal(key, schema, &val)
-                }))
+                self.transaction(|tx| tx.tx_insert(key, schema, &val))
             }
             SchemaItem::Scalar => Err(ServerError::NonDocumentInsert),
         }
     }
 
     pub fn update(&self, key: &Ref, val: Value) -> Result<(), ServerError> {
-        // TODO: transactional
         let schema = self.schema.resolve(&key.0)?;
-        match schema {
-            SchemaItem::Collection(_inner) => {
-                let Value::Object(obj) = val else {
-                    return Err(ServerError::SchemaMismatch);
-                };
-                let encoded_ref = self.schema.encode_ref(&key.0);
-                if !self.store.contains_key(&encoded_ref)? {
-                    return Err(ServerError::KeyNotFound);
-                }
-                for (primary_key, value) in obj {
-                    let mut sub_key = key.clone();
-                    sub_key.0.push(primary_key);
-                    self.update(&sub_key, value)?;
-                }
-            }
-            SchemaItem::Document(fields) => {
-                let Value::Object(obj) = val else {
-                    return Err(ServerError::SchemaMismatch);
-                };
-                let encoded_ref = self.schema.encode_ref(&key.0);
-                self.store.remove(&encoded_ref)?;
-                if !self.store.contains_key(encoded_ref)? {
-                    return Err(ServerError::KeyNotFound);
-                }
-                for (obj_key, obj_value) in obj {
-                    if !fields.contains_key(&obj_key) {
-                        return Err(ServerError::ExtraKeyFound);
-                    }
-                    let mut sub_key = key.clone();
-                    sub_key.0.push(obj_key);
-                    self.update(&sub_key, obj_value)?;
-                }
-            }
-            SchemaItem::Scalar => {
-                let Value::String(val) = val else {
-                    return Err(ServerError::SchemaMismatch);
-                };
-                let encoded_ref = self.schema.encode_ref(&key.0);
-                if !self.store.contains_key(&encoded_ref)? {
-                    return Err(ServerError::KeyNotFound);
-                }
-                self.store.insert(&encoded_ref, val.as_bytes())?;
-            }
-        }
-
-        Ok(())
+        self.transaction(|tx| tx.tx_update(key, schema, &val))
     }
 
     pub fn remove(&self, key: &Ref) -> Result<(), ServerError> {
-        // TODO: transactional
         let schema = self.schema.resolve(&key.0)?;
-        match schema {
-            SchemaItem::Collection(_inner) => {
-                let encoded_ref = self.schema.encode_ref(&key.0);
-                let Some(value) = self.store.get(&encoded_ref)? else {
-                    return Err(ServerError::KeyNotFound);
-                };
-                let keys: HashSet<String> = bincode::deserialize(value.as_ref())
-                    .expect("collections are encoded via bincode");
-                for child in keys {
-                    let mut sub_key = key.clone();
-                    sub_key.0.push(child.clone());
-                    self.remove(&sub_key)?;
-                }
-                self.store.remove(&encoded_ref)?;
-            }
-            SchemaItem::Document(fields) => {
-                let encoded_ref = self.schema.encode_ref(&key.0);
-                self.store.remove(&encoded_ref)?;
-                for field in fields.keys() {
-                    let mut sub_key = key.clone();
-                    sub_key.0.push(field.clone());
-                    self.remove(&sub_key)?;
-                }
-            }
-            SchemaItem::Scalar => {
-                let encoded_ref = self.schema.encode_ref(&key.0);
-                self.store.remove(&encoded_ref)?;
-            }
-        }
-        if key.0.len() > 1 {
-            let parent_ref = &key.0[..key.0.len() - 1];
-            let parent_schema = self.schema.resolve(parent_ref)?;
-            if let SchemaItem::Collection(_) = parent_schema {
-                let encoded_collection_key = self.schema.encode_ref(parent_ref);
-                let mut keys: HashSet<String> = self
-                    .store
-                    .get(&encoded_collection_key)?
-                    .map(|collection_value| {
-                        bincode::deserialize(collection_value.as_ref()).expect("keys are bincoded")
-                    })
-                    .unwrap_or(HashSet::new());
-                keys.remove(key.0.last().unwrap());
-                let keys_encoded = bincode::serialize(&keys).unwrap();
-                self.store.insert(&encoded_collection_key, keys_encoded)?;
-            }
-        }
-
-        Ok(())
+        self.transaction(|tx| tx.tx_remove(key, schema))
     }
 
     pub fn subscribe(&self, key: &Ref) -> SubscriptionStream {
@@ -223,6 +123,18 @@ impl Server {
             schema: self.schema.clone(),
         }
     }
+
+    fn transaction(
+        &self,
+        tx: impl Fn(TransactionHandler) -> Result<(), ConflictableTransactionError<ServerError>>,
+    ) -> Result<(), ServerError> {
+        tx_result(self.store.transaction(|tx_db| {
+            tx(TransactionHandler {
+                store: tx_db,
+                schema: &self.schema,
+            })
+        }))
+    }
 }
 
 struct TransactionHandler<'a> {
@@ -231,7 +143,7 @@ struct TransactionHandler<'a> {
 }
 
 impl TransactionHandler<'_> {
-    fn insert_internal(
+    fn tx_insert(
         &self,
         key: &Ref,
         schema: &SchemaItem,
@@ -246,7 +158,7 @@ impl TransactionHandler<'_> {
                 for (primary_key, value) in obj {
                     let mut sub_key = key.clone();
                     sub_key.0.push(primary_key.clone());
-                    self.insert_internal(&sub_key, inner, value)?;
+                    self.tx_insert(&sub_key, inner, value)?;
                 }
             }
             SchemaItem::Document(fields) => {
@@ -270,7 +182,7 @@ impl TransactionHandler<'_> {
                     let field = &fields[obj_key];
                     let mut sub_key = key.clone();
                     sub_key.0.push(obj_key.clone());
-                    self.insert_internal(&sub_key, field, obj_value)?;
+                    self.tx_insert(&sub_key, field, obj_value)?;
                 }
             }
             SchemaItem::Scalar => {
@@ -303,6 +215,118 @@ impl TransactionHandler<'_> {
                     self.store
                         .insert(&encoded_collection_key[..], keys_encoded)?;
                 }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn tx_update(
+        &self,
+        key: &Ref,
+        schema: &SchemaItem,
+        val: &Value,
+    ) -> Result<(), ConflictableTransactionError<ServerError>> {
+        match schema {
+            SchemaItem::Collection(inner) => {
+                let Value::Object(obj) = val else {
+                    return abort(ServerError::SchemaMismatch);
+                };
+                let encoded_ref = self.schema.encode_ref(&key.0);
+                if !self.store.get(&encoded_ref)?.is_some() {
+                    return abort(ServerError::KeyNotFound);
+                }
+                for (primary_key, value) in obj {
+                    let mut sub_key = key.clone();
+                    sub_key.0.push(primary_key.clone());
+                    self.tx_update(&sub_key, inner, value)?;
+                }
+            }
+            SchemaItem::Document(fields) => {
+                let Value::Object(obj) = val else {
+                    return abort(ServerError::SchemaMismatch);
+                };
+                let encoded_ref = self.schema.encode_ref(&key.0);
+                self.store.remove(&encoded_ref[..])?;
+                if !self.store.get(encoded_ref)?.is_some() {
+                    return abort(ServerError::KeyNotFound);
+                }
+                for (obj_key, obj_value) in obj {
+                    let Some(field) = fields.get(obj_key) else {
+                        return abort(ServerError::ExtraKeyFound);
+                    };
+                    let mut sub_key = key.clone();
+                    sub_key.0.push(obj_key.clone());
+                    self.tx_update(&sub_key, field, obj_value)?;
+                }
+            }
+            SchemaItem::Scalar => {
+                let Value::String(val) = val else {
+                    return abort(ServerError::SchemaMismatch);
+                };
+                let encoded_ref = self.schema.encode_ref(&key.0);
+                if !self.store.get(&encoded_ref)?.is_some() {
+                    return abort(ServerError::KeyNotFound);
+                }
+                self.store.insert(&encoded_ref[..], val.as_bytes())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn tx_remove(
+        &self,
+        key: &Ref,
+        schema: &SchemaItem,
+    ) -> Result<(), ConflictableTransactionError<ServerError>> {
+        match schema {
+            SchemaItem::Collection(inner) => {
+                let encoded_ref = self.schema.encode_ref(&key.0);
+                let Some(value) = self.store.get(&encoded_ref)? else {
+                    return abort(ServerError::KeyNotFound);
+                };
+                let keys: HashSet<String> = bincode::deserialize(value.as_ref())
+                    .expect("collections are encoded via bincode");
+                for child in keys {
+                    let mut sub_key = key.clone();
+                    sub_key.0.push(child.clone());
+                    self.tx_remove(&sub_key, inner)?;
+                }
+                self.store.remove(&encoded_ref[..])?;
+            }
+            SchemaItem::Document(fields) => {
+                let encoded_ref = self.schema.encode_ref(&key.0);
+                self.store.remove(&encoded_ref[..])?;
+                for (field, ty) in fields {
+                    let mut sub_key = key.clone();
+                    sub_key.0.push(field.clone());
+                    self.tx_remove(&sub_key, ty)?;
+                }
+            }
+            SchemaItem::Scalar => {
+                let encoded_ref = self.schema.encode_ref(&key.0);
+                self.store.remove(&encoded_ref[..])?;
+            }
+        }
+        if key.0.len() > 1 {
+            let parent_ref = &key.0[..key.0.len() - 1];
+            let parent_schema = match self.schema.resolve(parent_ref) {
+                Ok(schema) => schema,
+                Err(err) => return abort(err.into()),
+            };
+            if let SchemaItem::Collection(_) = parent_schema {
+                let encoded_collection_key = self.schema.encode_ref(parent_ref);
+                let mut keys: HashSet<String> = self
+                    .store
+                    .get(&encoded_collection_key)?
+                    .map(|collection_value| {
+                        bincode::deserialize(collection_value.as_ref()).expect("keys are bincoded")
+                    })
+                    .unwrap_or(HashSet::new());
+                keys.remove(key.0.last().unwrap());
+                let keys_encoded = bincode::serialize(&keys).unwrap();
+                self.store
+                    .insert(&encoded_collection_key[..], keys_encoded)?;
             }
         }
 
