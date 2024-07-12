@@ -18,6 +18,10 @@ pub enum ServerError {
     SchemaError(#[from] SchemaResolutionError),
     #[error("key not found")]
     KeyNotFound,
+    #[error("extra key found")]
+    ExtraKeyFound,
+    #[error("schema mismatch")]
+    SchemaMismatch,
 }
 
 #[derive(Clone)]
@@ -64,13 +68,37 @@ impl Server {
         }
     }
 
+    // TODO: back off mutations if schema fails to match
     pub fn set(&self, key: &Ref, val: Value) -> Result<(), ServerError> {
-        let schema = dbg!(self.schema.resolve(&key.0)?);
+        //let parent_schema = self.schema.resolve(&key.0[..key.0.len() - 1])?;
+        let schema = self.schema.resolve(&key.0)?;
         match schema {
             SchemaItem::Collection(_) => todo!("return error: can't set a collection?"),
-            SchemaItem::Document(_) => todo!(),
+            SchemaItem::Document(fields) => {
+                let Value::Object(obj) = val else {
+                    return Err(ServerError::SchemaMismatch);
+                };
+                for entry in obj.keys() {
+                    if !fields.contains_key(entry) {
+                        return Err(ServerError::ExtraKeyFound);
+                    }
+                }
+                for field in fields.keys() {
+                    if !obj.contains_key(field) {
+                        return Err(ServerError::SchemaMismatch);
+                    }
+                }
+                for (obj_key, obj_value) in obj {
+                    let mut sub_key = key.clone();
+                    sub_key.0.push(obj_key);
+                    self.set(&sub_key, obj_value)?;
+                }
+            }
             SchemaItem::Scalar => {
-                let Value::String(val) = val else { todo!() };
+                // TODO: ensure the document is initialized
+                let Value::String(val) = val else {
+                    return Err(ServerError::SchemaMismatch);
+                };
                 let encoded_ref = self.schema.encode_ref(&key.0);
                 self.store.insert(&encoded_ref, val.as_bytes())?;
             }
@@ -228,5 +256,51 @@ mod tests {
         }
 
         handle.await.unwrap();
+    }
+
+    #[test]
+    fn set_object() {
+        let server = test_server();
+        let r = Ref(vec!["hello".to_string()]);
+        let obj = Value::Object(
+            [
+                ("world".to_string(), Value::String("1".to_string())),
+                ("new york".to_string(), Value::String("2".to_string())),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        server.set(&r, obj).unwrap();
+
+        assert_eq!(
+            server
+                .get(&Ref(vec!["hello".to_string(), "world".to_string()]))
+                .unwrap(),
+            Value::String("1".to_string()),
+        );
+        assert_eq!(
+            server
+                .get(&Ref(vec!["hello".to_string(), "new york".to_string()]))
+                .unwrap(),
+            Value::String("2".to_string()),
+        );
+    }
+
+    #[test]
+    fn get_object() {
+        let server = test_server();
+        let r = Ref(vec!["hello".to_string()]);
+        let obj = Value::Object(
+            [
+                ("world".to_string(), Value::String("1".to_string())),
+                ("new york".to_string(), Value::String("2".to_string())),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        server.set(&r, obj.clone()).unwrap();
+        let result_obj = server.get(&Ref(vec!["hello".to_string()])).unwrap();
+
+        assert_eq!(obj, result_obj);
     }
 }
