@@ -47,9 +47,9 @@ impl Server {
             SchemaItem::Collection(_inner) => {
                 let encoded_ref = self.schema.encode_ref(&key.0);
                 let Some(value) = self.store.get(&encoded_ref)? else {
-                    return Err(ServerError::KeyNotFound);
+                    return Ok(Value::Object(Map::new()));
                 };
-                let keys: Vec<String> = bincode::deserialize(value.as_ref())
+                let keys: HashSet<String> = bincode::deserialize(value.as_ref())
                     .expect("collections are encoded via bincode");
                 let mut result = Map::new();
                 for child in keys {
@@ -146,7 +146,20 @@ impl Server {
         // TODO: transactional
         let schema = self.schema.resolve(&key.0)?;
         match schema {
-            SchemaItem::Collection(_) => todo!("return error: can't remove a collection?"),
+            SchemaItem::Collection(_inner) => {
+                let encoded_ref = self.schema.encode_ref(&key.0);
+                let Some(value) = self.store.get(&encoded_ref)? else {
+                    return Err(ServerError::KeyNotFound);
+                };
+                let keys: HashSet<String> = bincode::deserialize(value.as_ref())
+                    .expect("collections are encoded via bincode");
+                for child in keys {
+                    let mut sub_key = key.clone();
+                    sub_key.0.push(child.clone());
+                    self.remove(&sub_key)?;
+                }
+                self.store.remove(&encoded_ref)?;
+            }
             SchemaItem::Document(fields) => {
                 for field in fields.keys() {
                     let mut sub_key = key.clone();
@@ -356,6 +369,26 @@ mod tests {
             .unwrap();
 
         server.remove(&create_ref(&["fruits", "apple"])).unwrap();
+
+        let all_fruits = server.get(&create_ref(&["fruits"])).unwrap();
+        assert_eq!(all_fruits, Value::Object(Map::new()));
+    }
+
+    #[test]
+    fn delete_collection() {
+        let server = collection_server();
+
+        server
+            .set(&create_ref(&["fruits", "apple"]), map(&[("color", "red")]))
+            .unwrap();
+        server
+            .set(
+                &create_ref(&["fruits", "banana"]),
+                map(&[("color", "yellow")]),
+            )
+            .unwrap();
+
+        server.remove(&create_ref(&["fruits"])).unwrap();
 
         let all_fruits = server.get(&create_ref(&["fruits"])).unwrap();
         assert_eq!(all_fruits, Value::Object(Map::new()));
