@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use futures_util::{FutureExt, Stream};
 use serde_json::{Map, Value};
@@ -124,15 +124,15 @@ impl Server {
             let parent_schema = self.schema.resolve(parent_ref)?;
             if let SchemaItem::Collection(_) = parent_schema {
                 let encoded_collection_key = self.schema.encode_ref(parent_ref);
-                let mut keys: Vec<String> = self
+                let mut keys: HashSet<String> = self
                     .store
                     .get(&encoded_collection_key)?
                     .map(|collection_value| {
                         bincode::deserialize(collection_value.as_ref()).expect("keys are bincoded")
                     })
-                    .unwrap_or(Vec::new());
+                    .unwrap_or(HashSet::new());
                 if !keys.contains(key.0.last().unwrap()) {
-                    keys.push(key.0.last().unwrap().clone());
+                    keys.insert(key.0.last().unwrap().clone());
                     let keys_encoded = bincode::serialize(&keys).unwrap();
                     self.store.insert(&encoded_collection_key, keys_encoded)?;
                 }
@@ -143,15 +143,40 @@ impl Server {
     }
 
     pub fn remove(&self, key: &Ref) -> Result<(), ServerError> {
+        // TODO: transactional
         let schema = self.schema.resolve(&key.0)?;
         match schema {
             SchemaItem::Collection(_) => todo!("return error: can't remove a collection?"),
-            SchemaItem::Document(_) => todo!(),
+            SchemaItem::Document(fields) => {
+                for field in fields.keys() {
+                    let mut sub_key = key.clone();
+                    sub_key.0.push(field.clone());
+                    self.remove(&sub_key)?;
+                }
+            }
             SchemaItem::Scalar => {
                 let encoded_ref = self.schema.encode_ref(&key.0);
                 self.store.remove(&encoded_ref)?;
             }
         }
+        if key.0.len() > 1 {
+            let parent_ref = &key.0[..key.0.len() - 1];
+            let parent_schema = self.schema.resolve(parent_ref)?;
+            if let SchemaItem::Collection(_) = parent_schema {
+                let encoded_collection_key = self.schema.encode_ref(parent_ref);
+                let mut keys: HashSet<String> = self
+                    .store
+                    .get(&encoded_collection_key)?
+                    .map(|collection_value| {
+                        bincode::deserialize(collection_value.as_ref()).expect("keys are bincoded")
+                    })
+                    .unwrap_or(HashSet::new());
+                keys.remove(key.0.last().unwrap());
+                let keys_encoded = bincode::serialize(&keys).unwrap();
+                self.store.insert(&encoded_collection_key, keys_encoded)?;
+            }
+        }
+
         Ok(())
     }
 
@@ -211,7 +236,7 @@ mod tests {
     use std::sync::Arc;
 
     use futures_util::StreamExt;
-    use serde_json::Value;
+    use serde_json::{Map, Value};
     use sled::Config;
 
     use crate::{
@@ -222,7 +247,147 @@ mod tests {
 
     use super::Server;
 
-    fn test_server() -> Server {
+    #[test]
+    fn values() {
+        let server = document_server();
+        let r = create_ref(&["hello", "world"]);
+        server.set(&r, Value::String("value".to_string())).unwrap();
+        assert_eq!(server.get(&r).unwrap().as_str().unwrap(), "value");
+    }
+
+    #[tokio::test]
+    async fn subscription() {
+        let server = document_server();
+        let r = create_ref(&["hello", "world"]);
+
+        let mut subscription = server.subscribe(&r);
+
+        let count_up_to = 5;
+
+        let write_server = server.clone();
+        let r_ = r.clone();
+        let handle = tokio::spawn(async move {
+            for i in 0..count_up_to {
+                write_server.set(&r_, Value::String(i.to_string())).unwrap();
+            }
+        });
+
+        let mut expected = 0;
+        while let Some(event) = subscription.next().await {
+            let Event::Insert { key, value } = event else {
+                panic!("expected insert event");
+            };
+            assert_eq!(&key, &r);
+            assert_eq!(String::from_utf8(value.to_vec()), Ok(expected.to_string()));
+
+            expected += 1;
+            if expected >= count_up_to {
+                break;
+            }
+        }
+
+        handle.await.unwrap();
+    }
+
+    #[test]
+    fn set_object() {
+        let server = document_server();
+        let r = Ref(vec!["hello".to_string()]);
+        let obj = map(&[("world", "1"), ("new york", "2")]);
+        server.set(&r, obj).unwrap();
+
+        assert_eq!(
+            server.get(&create_ref(&["hello", "world"])).unwrap(),
+            Value::String("1".to_string()),
+        );
+        assert_eq!(
+            server.get(&create_ref(&["hello", "new york"])).unwrap(),
+            Value::String("2".to_string()),
+        );
+    }
+
+    #[test]
+    fn get_object() {
+        let server = document_server();
+        let r = Ref(vec!["hello".to_string()]);
+        let obj = map(&[("world", "1"), ("new york", "2")]);
+        server.set(&r, obj.clone()).unwrap();
+        let result_obj = server.get(&Ref(vec!["hello".to_string()])).unwrap();
+
+        assert_eq!(obj, result_obj);
+    }
+
+    #[test]
+    fn get_collection() {
+        let server = collection_server();
+
+        server
+            .set(&create_ref(&["fruits", "apple"]), map(&[("color", "red")]))
+            .unwrap();
+        server
+            .set(
+                &create_ref(&["fruits", "banana"]),
+                map(&[("color", "yellow")]),
+            )
+            .unwrap();
+        server
+            .set(
+                &create_ref(&["fruits", "blueberry"]),
+                map(&[("color", "purple")]),
+            )
+            .unwrap();
+        let all_fruits = server.get(&create_ref(&["fruits"])).unwrap();
+        assert_eq!(
+            all_fruits,
+            map(&[
+                ("apple", map(&[("color", "red")])),
+                ("banana", map(&[("color", "yellow")])),
+                ("blueberry", map(&[("color", "purple")])),
+            ])
+        );
+    }
+
+    #[test]
+    fn delete_document() {
+        let server = collection_server();
+
+        server
+            .set(&create_ref(&["fruits", "apple"]), map(&[("color", "red")]))
+            .unwrap();
+
+        server.remove(&create_ref(&["fruits", "apple"])).unwrap();
+
+        let all_fruits = server.get(&create_ref(&["fruits"])).unwrap();
+        assert_eq!(all_fruits, Value::Object(Map::new()));
+    }
+
+    fn collection_server() -> Server {
+        let db = Config::new()
+            .temporary(true)
+            .flush_every_ms(None)
+            .open()
+            .unwrap();
+
+        let test_schema = Schema::new(SchemaItem::Document(
+            [(
+                "fruits".to_string(),
+                SchemaItem::Collection(Box::new(SchemaItem::Document(
+                    [("color".to_string(), SchemaItem::Scalar)]
+                        .into_iter()
+                        .collect(),
+                ))),
+            )]
+            .into_iter()
+            .collect(),
+        ));
+
+        Server {
+            store: db,
+            schema: Arc::new(test_schema),
+        }
+    }
+
+    fn document_server() -> Server {
         let db = Config::new()
             .temporary(true)
             .flush_every_ms(None)
@@ -265,117 +430,5 @@ mod tests {
                 .map(|(key, value)| (key.to_string(), value.clone().into()))
                 .collect(),
         )
-    }
-
-    #[test]
-    fn values() {
-        let server = test_server();
-        let r = create_ref(&["hello", "world"]);
-        server.set(&r, Value::String("value".to_string())).unwrap();
-        assert_eq!(server.get(&r).unwrap().as_str().unwrap(), "value");
-    }
-
-    #[tokio::test]
-    async fn subscription() {
-        let server = test_server();
-        let r = create_ref(&["hello", "world"]);
-
-        let mut subscription = server.subscribe(&r);
-
-        let count_up_to = 5;
-
-        let write_server = server.clone();
-        let r_ = r.clone();
-        let handle = tokio::spawn(async move {
-            for i in 0..count_up_to {
-                write_server.set(&r_, Value::String(i.to_string())).unwrap();
-            }
-        });
-
-        let mut expected = 0;
-        while let Some(event) = subscription.next().await {
-            let Event::Insert { key, value } = event else {
-                panic!("expected insert event");
-            };
-            assert_eq!(&key, &r);
-            assert_eq!(String::from_utf8(value.to_vec()), Ok(expected.to_string()));
-
-            expected += 1;
-            if expected >= count_up_to {
-                break;
-            }
-        }
-
-        handle.await.unwrap();
-    }
-
-    #[test]
-    fn set_object() {
-        let server = test_server();
-        let r = Ref(vec!["hello".to_string()]);
-        let obj = map(&[("world", "1"), ("new york", "2")]);
-        server.set(&r, obj).unwrap();
-
-        assert_eq!(
-            server.get(&create_ref(&["hello", "world"])).unwrap(),
-            Value::String("1".to_string()),
-        );
-        assert_eq!(
-            server.get(&create_ref(&["hello", "new york"])).unwrap(),
-            Value::String("2".to_string()),
-        );
-    }
-
-    #[test]
-    fn get_object() {
-        let server = test_server();
-        let r = Ref(vec!["hello".to_string()]);
-        let obj = map(&[("world", "1"), ("new york", "2")]);
-        server.set(&r, obj.clone()).unwrap();
-        let result_obj = server.get(&Ref(vec!["hello".to_string()])).unwrap();
-
-        assert_eq!(obj, result_obj);
-    }
-
-    #[test]
-    fn get_collection() {
-        let mut server = test_server();
-        server.schema = Arc::new(Schema::new(SchemaItem::Document(
-            [(
-                "fruits".to_string(),
-                SchemaItem::Collection(Box::new(SchemaItem::Document(
-                    [("color".to_string(), SchemaItem::Scalar)]
-                        .into_iter()
-                        .collect(),
-                ))),
-            )]
-            .into_iter()
-            .collect(),
-        )));
-
-        server
-            .set(&create_ref(&["fruits", "apple"]), map(&[("color", "red")]))
-            .unwrap();
-        server
-            .set(
-                &create_ref(&["fruits", "banana"]),
-                map(&[("color", "yellow")]),
-            )
-            .unwrap();
-        server
-            .set(
-                &create_ref(&["fruits", "blueberry"]),
-                map(&[("color", "purple")]),
-            )
-            .unwrap();
-        let all_fruits = server.get(&create_ref(&["fruits"])).unwrap();
-        assert_eq!(
-            all_fruits,
-            map(&[
-                ("apple", map(&[("color", "red")])),
-                ("banana", map(&[("color", "yellow")])),
-                ("blueberry", map(&[("color", "purple")])),
-            ])
-        );
     }
 }
