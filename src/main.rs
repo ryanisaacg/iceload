@@ -81,12 +81,13 @@ async fn client_task(server: Server, stream: TcpStream) -> anyhow::Result<()> {
                 println!("Get result {value:?}");
                 send_resp.send(ServerMessage::Value(value)).unwrap();
             }
-            ClientMessage::Set(key, value) => match server.set(&key, value) {
+            ClientMessage::Insert(key, value) => match server.insert(&key, value) {
                 Ok(_) => send_resp.send(ServerMessage::Value(Value::Null)).unwrap(),
                 Err(e) => send_resp
                     .send(ServerMessage::Error(format!("{e}")))
                     .unwrap(),
             },
+            ClientMessage::Update(key, value) => todo!(),
             ClientMessage::Remove(key) => match server.remove(&key) {
                 Ok(_) => send_resp.send(ServerMessage::Value(Value::Null)).unwrap(),
                 Err(e) => send_resp

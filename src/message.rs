@@ -6,7 +6,8 @@ use serde_json::Value;
 #[derive(Debug, Deserialize, Serialize)]
 pub enum ClientMessage {
     Get(Ref),
-    Set(Ref, Value),
+    Insert(Ref, Value),
+    Update(Ref, Value),
     Remove(Ref),
     Subscribe(Ref),
     Unsubscribe(Ref),
