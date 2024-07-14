@@ -53,7 +53,7 @@ impl Server {
         match schema {
             SchemaItem::Collection(_inner) => {
                 let encoded_ref = self.schema.encode_ref(&key.0);
-                let Some(value) = self.store.get(&encoded_ref)? else {
+                let Some(value) = self.store.get(encoded_ref)? else {
                     return Ok(Value::Object(Map::new()));
                 };
                 let keys: HashSet<String> = bincode::deserialize(value.as_ref())
@@ -69,7 +69,7 @@ impl Server {
             }
             SchemaItem::Document(fields) => {
                 let encoded_ref = self.schema.encode_ref(&key.0);
-                if !self.store.contains_key(&encoded_ref)? {
+                if !self.store.contains_key(encoded_ref)? {
                     return Ok(Value::Null);
                 }
 
@@ -84,7 +84,7 @@ impl Server {
             }
             SchemaItem::Scalar => {
                 let encoded_ref = self.schema.encode_ref(&key.0);
-                match self.store.get(&encoded_ref)? {
+                match self.store.get(encoded_ref)? {
                     Some(val) => {
                         let val = val.to_vec();
                         let string = String::from_utf8(val).expect("string value");
@@ -119,7 +119,7 @@ impl Server {
     pub fn subscribe(&self, key: &Ref) -> SubscriptionStream {
         let encoded_ref = self.schema.encode_ref(&key.0);
         SubscriptionStream {
-            sub: self.store.watch_prefix(&encoded_ref),
+            sub: self.store.watch_prefix(encoded_ref),
             schema: self.schema.clone(),
         }
     }
@@ -233,7 +233,7 @@ impl TransactionHandler<'_> {
                     return abort(ServerError::SchemaMismatch);
                 };
                 let encoded_ref = self.schema.encode_ref(&key.0);
-                if !self.store.get(&encoded_ref)?.is_some() {
+                if self.store.get(encoded_ref)?.is_none() {
                     return abort(ServerError::KeyNotFound);
                 }
                 for (primary_key, value) in obj {
@@ -248,7 +248,7 @@ impl TransactionHandler<'_> {
                 };
                 let encoded_ref = self.schema.encode_ref(&key.0);
                 self.store.remove(&encoded_ref[..])?;
-                if !self.store.get(encoded_ref)?.is_some() {
+                if self.store.get(encoded_ref)?.is_none() {
                     return abort(ServerError::KeyNotFound);
                 }
                 for (obj_key, obj_value) in obj {
@@ -265,7 +265,7 @@ impl TransactionHandler<'_> {
                     return abort(ServerError::SchemaMismatch);
                 };
                 let encoded_ref = self.schema.encode_ref(&key.0);
-                if !self.store.get(&encoded_ref)?.is_some() {
+                if self.store.get(&encoded_ref)?.is_none() {
                     return abort(ServerError::KeyNotFound);
                 }
                 self.store.insert(&encoded_ref[..], val.as_bytes())?;

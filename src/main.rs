@@ -11,16 +11,23 @@ use tokio_tungstenite::{
 
 mod message;
 use message::{ClientMessage, ServerMessage};
+mod permission;
 mod schema;
 mod server;
 use server::Server;
 
-use crate::server::Event;
+use crate::{
+    permission::{Operation, Permissions},
+    server::Event,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let addr = "127.0.0.1:9002";
     let listener = TcpListener::bind(&addr).await?;
+
+    let source = std::fs::read_to_string("permission.luau")?;
+    let permission_bytecode = Permissions::load_bytecode(&source)?;
 
     let test_schema = Schema::new(SchemaItem::Document(
         [(
@@ -42,13 +49,23 @@ async fn main() -> anyhow::Result<()> {
 
     while let Ok((stream, _)) = listener.accept().await {
         let server = server.clone();
-        tokio::spawn(async move { client_task(server, stream).await.unwrap() });
+        tokio::spawn(async move {
+            client_task(server, stream, permission_bytecode)
+                .await
+                .unwrap()
+        });
     }
 
     Ok(())
 }
 
-async fn client_task(server: Server, stream: TcpStream) -> anyhow::Result<()> {
+async fn client_task(
+    server: Server,
+    stream: TcpStream,
+    permission_bytecode: &[u8],
+) -> anyhow::Result<()> {
+    let permissions = Permissions::new(permission_bytecode);
+
     let ws_stream = accept_async(stream).await.expect("Failed to accept");
     let (mut ws_send, mut ws_recv) = ws_stream.split();
 
@@ -67,7 +84,6 @@ async fn client_task(server: Server, stream: TcpStream) -> anyhow::Result<()> {
     let mut subscriptions = HashMap::new();
 
     while let Some(msg) = ws_recv.next().await {
-        println!("{msg:?}");
         let msg = match msg {
             Ok(msg) => msg,
             Err(Error::ConnectionClosed) => break,
@@ -77,29 +93,50 @@ async fn client_task(server: Server, stream: TcpStream) -> anyhow::Result<()> {
         let msg: ClientMessage = serde_json::from_str(msg)?;
         match msg {
             ClientMessage::Get(key) => {
+                if !permissions.check(Operation::Read, &key)? {
+                    send_resp.send(ServerMessage::Error("permissions".into()))?;
+                }
                 let value = server.get(&key).unwrap();
                 println!("Get result {value:?}");
                 send_resp.send(ServerMessage::Value(value)).unwrap();
             }
-            ClientMessage::Insert(key, value) => match server.insert(&key, value) {
-                Ok(_) => send_resp.send(ServerMessage::Value(Value::Null)).unwrap(),
-                Err(e) => send_resp
-                    .send(ServerMessage::Error(format!("{e}")))
-                    .unwrap(),
-            },
-            ClientMessage::Update(key, value) => match server.update(&key, value) {
-                Ok(_) => send_resp.send(ServerMessage::Value(Value::Null)).unwrap(),
-                Err(e) => send_resp
-                    .send(ServerMessage::Error(format!("{e}")))
-                    .unwrap(),
-            },
-            ClientMessage::Remove(key) => match server.remove(&key) {
-                Ok(_) => send_resp.send(ServerMessage::Value(Value::Null)).unwrap(),
-                Err(e) => send_resp
-                    .send(ServerMessage::Error(format!("{e}")))
-                    .unwrap(),
-            },
+            ClientMessage::Insert(key, value) => {
+                if !permissions.check(Operation::Insert, &key)? {
+                    send_resp.send(ServerMessage::Error("permissions".into()))?;
+                }
+                match server.insert(&key, value) {
+                    Ok(_) => send_resp.send(ServerMessage::Value(Value::Null)).unwrap(),
+                    Err(e) => send_resp
+                        .send(ServerMessage::Error(format!("{e}")))
+                        .unwrap(),
+                }
+            }
+            ClientMessage::Update(key, value) => {
+                if !permissions.check(Operation::Update, &key)? {
+                    send_resp.send(ServerMessage::Error("permissions".into()))?;
+                }
+                match server.update(&key, value) {
+                    Ok(_) => send_resp.send(ServerMessage::Value(Value::Null)).unwrap(),
+                    Err(e) => send_resp
+                        .send(ServerMessage::Error(format!("{e}")))
+                        .unwrap(),
+                }
+            }
+            ClientMessage::Remove(key) => {
+                if !permissions.check(Operation::Remove, &key)? {
+                    send_resp.send(ServerMessage::Error("permissions".into()))?;
+                }
+                match server.remove(&key) {
+                    Ok(_) => send_resp.send(ServerMessage::Value(Value::Null)).unwrap(),
+                    Err(e) => send_resp
+                        .send(ServerMessage::Error(format!("{e}")))
+                        .unwrap(),
+                }
+            }
             ClientMessage::Subscribe(key) => {
+                if !permissions.check(Operation::Read, &key)? {
+                    send_resp.send(ServerMessage::Error("permissions".into()))?;
+                }
                 let mut subscriber = server.subscribe(&key);
                 let sender = send_resp.clone();
                 let key_ = key.clone();
